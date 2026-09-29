@@ -546,6 +546,22 @@ def test_extract_reasoning_stays_disabled_for_lone_end_marker():
     assert content == "Before <channel|> after"
 
 
+def test_extract_reasoning_strips_end_only_think_marker_when_disabled():
+    from vllm_mlx.reasoning.deepseek_r1_parser import DeepSeekR1ReasoningParser
+
+    saved = srv._reasoning_parser
+    srv._reasoning_parser = DeepSeekR1ReasoningParser()
+    try:
+        reasoning, content, _ = srv._extract_reasoning_and_tool_calls(
+            "Private reasoning</think>Visible answer", None, allow_reasoning=False
+        )
+    finally:
+        srv._reasoning_parser = saved
+
+    assert reasoning is None
+    assert content == "Visible answer"
+
+
 @pytest.mark.anyio
 async def test_stream_anthropic_strips_markers_when_thinking_disabled():
     async def fake_stream_chat(messages, **kwargs):

@@ -3157,8 +3157,7 @@ def _responses_sse_event(event_type: str, payload: BaseModel | dict) -> str:
 
 def _explicit_reasoning_markers_present(text: str, parser=None) -> bool:
     """
-    True when the active reasoning parser's explicit start marker appears
-    in ``text``.
+    True when an explicit reasoning marker appears in ``text``.
 
     The allow_reasoning gate (PR #537) exists to keep implicit-thinking
     parsers from swallowing plain content into reasoning when thinking is
@@ -3173,7 +3172,13 @@ def _explicit_reasoning_markers_present(text: str, parser=None) -> bool:
     if not active_parser:
         return False
     start = getattr(active_parser, "start_token", None)
-    return bool(start and start in text)
+    if start and start in text:
+        return True
+    end = getattr(active_parser, "end_token", None)
+    # Think-tag parsers accept a closing tag without an opening tag when the
+    # prompt seeded reasoning. Gemma's <channel|> can also be ordinary text,
+    # so require a channel opener before activating that parser.
+    return bool(end and end != "<channel|>" and end in text)
 
 
 _HARMONY_ANALYSIS_BLOCK_RE = re.compile(
