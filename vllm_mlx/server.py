@@ -1297,9 +1297,12 @@ def _prepare_streaming_reasoning_parser(
     chat_kwargs: dict[str, object],
     *,
     allowed: bool = True,
+    allow_disabled_thinking: bool = False,
 ):
-    """Build and reset request-local reasoning state when thinking is enabled."""
-    if not allowed or _thinking_disabled(request, chat_kwargs):
+    """Build and reset request-local reasoning state when eligible."""
+    if not allowed or (
+        _thinking_disabled(request, chat_kwargs) and not allow_disabled_thinking
+    ):
         return None
     parser = _build_reasoning_parser(engine)
     if parser is not None:
@@ -1313,7 +1316,12 @@ def _prepare_openai_stream_reasoning_state(
     chat_kwargs: dict[str, object],
 ) -> tuple[object | None, bool]:
     """Return request-local reasoning state and the legacy Nemotron marker state."""
-    parser = _prepare_streaming_reasoning_parser(engine, request, chat_kwargs)
+    parser = _prepare_streaming_reasoning_parser(
+        engine,
+        request,
+        chat_kwargs,
+        allow_disabled_thinking=True,
+    )
     is_thinking_model = (
         "nemotron" in (engine.model_name or "").lower()
         and not parser
@@ -2787,7 +2795,21 @@ async def _stream_responses_request(request: ResponsesRequest) -> AsyncIterator[
             sequence += 1
         return events
 
-    reasoning_parser = _prepare_streaming_reasoning_parser(engine, request, chat_kwargs)
+    reasoning_parser = _prepare_streaming_reasoning_parser(
+        engine,
+        request,
+        chat_kwargs,
+        allow_disabled_thinking=True,
+    )
+
+    # Streaming counterpart of the explicit-marker guard in
+    # _extract_reasoning_and_tool_calls: with thinking disabled the parser
+    # stays off until the model emits an explicit reasoning marker; from
+    # that point deltas are parsed so raw markers don't leak into the text
+    # output. Parsed reasoning is suppressed — the request disabled
+    # thinking, so only cleaned content is emitted.
+    thinking_off = _thinking_disabled(request, chat_kwargs)
+    disabled_reasoning_latched = False
 
     tool_parser = _get_streaming_tool_parser(chat_request, engine)
     tool_accumulated_text = ""
@@ -2825,7 +2847,7 @@ async def _stream_responses_request(request: ResponsesRequest) -> AsyncIterator[
             request, chat_kwargs
         )
         if not delta_text and not (
-            (use_reasoning and output_finished)
+            ((use_reasoning or disabled_reasoning_latched) and output_finished)
             or (tool_parser and tool_markup_possible and output_finished)
         ):
             continue
@@ -2833,7 +2855,22 @@ async def _stream_responses_request(request: ResponsesRequest) -> AsyncIterator[
         previous_text = raw_accumulated_text
         raw_accumulated_text += delta_text
 
-        if use_reasoning:
+        # Thinking is off, but the model emitted explicit reasoning markers
+        # anyway. Parse them rather than letting them detokenize into visible
+        # content. Latched: once markers appear, the rest of the stream is
+        # parsed too, so a marker split across chunks cannot re-open the gate
+        # halfway through.
+        if (
+            reasoning_parser
+            and thinking_off
+            and not disabled_reasoning_latched
+            and _explicit_reasoning_markers_present(
+                raw_accumulated_text, reasoning_parser
+            )
+        ):
+            disabled_reasoning_latched = True
+
+        if use_reasoning or disabled_reasoning_latched:
             delta_msg = _extract_streaming_reasoning_delta(
                 reasoning_parser,
                 previous_text,
@@ -2847,7 +2884,7 @@ async def _stream_responses_request(request: ResponsesRequest) -> AsyncIterator[
                 else:
                     continue
 
-            if delta_msg.reasoning:
+            if delta_msg.reasoning and not thinking_off:
                 for event in _start_reasoning_item():
                     yield event
                 accumulated_reasoning += delta_msg.reasoning
@@ -3118,6 +3155,28 @@ def _responses_sse_event(event_type: str, payload: BaseModel | dict) -> str:
     return f"event: {event_type}\ndata: {data}\n\n"
 
 
+def _explicit_reasoning_markers_present(text: str, parser=None) -> bool:
+    """
+    True when the active reasoning parser's explicit start/end markers
+    appear in ``text``.
+
+    The allow_reasoning gate (PR #537) exists to keep implicit-thinking
+    parsers from swallowing plain content into reasoning when thinking is
+    disabled. But models can open an explicit reasoning block regardless of
+    the template kwarg (Gemma 4 emits <|channel>thought even when thinking
+    is disabled) — with explicit markers present the implicit-swallowing
+    hazard cannot occur, while skipping the parser leaks the raw markers
+    into content. Non-streaming checks the complete output; streaming paths
+    use this as a latch on the accumulated raw text.
+    """
+    active_parser = parser if parser is not None else _reasoning_parser
+    if not active_parser:
+        return False
+    start = getattr(active_parser, "start_token", None)
+    end = getattr(active_parser, "end_token", None)
+    return bool((start and start in text) or (end and end in text))
+
+
 _HARMONY_ANALYSIS_BLOCK_RE = re.compile(
     r"<\|channel\|>analysis[^<]*(?:<\|constrain\|>[^<]*)?<\|message\|>.*?"
     r"(?=<\|channel\|>|<\|end\|>|\Z)",
@@ -3150,6 +3209,12 @@ def _extract_reasoning_and_tool_calls(
     """
     reasoning_text = None
     text_for_tool_parse = output_text
+
+    if _reasoning_parser and not allow_reasoning:
+        # Thinking is disabled, but the model opened an explicit reasoning
+        # block anyway — parse iff markers are present (see
+        # _explicit_reasoning_markers_present).
+        allow_reasoning = _explicit_reasoning_markers_present(output_text)
 
     if _reasoning_parser and allow_reasoning:
         reasoning_text, cleaned_reasoning_text = _reasoning_parser.extract_reasoning(
@@ -6240,8 +6305,19 @@ async def _stream_anthropic_messages(
         openai_request,
         chat_kwargs,
         allowed=not chat_kwargs.get("logits_processors"),
+        allow_disabled_thinking=True,
     )
-    use_reasoning = reasoning_parser is not None
+    thinking_off = _thinking_disabled(openai_request, chat_kwargs)
+    use_reasoning = reasoning_parser is not None and not thinking_off
+
+    # Streaming counterpart of the explicit-marker guard in
+    # _extract_reasoning_and_tool_calls: with thinking disabled the parser
+    # stays off until the model emits an explicit reasoning marker; from
+    # that point deltas are parsed so raw markers don't leak into the text
+    # block. Parsed reasoning is suppressed — the request disabled
+    # thinking, so only cleaned content is emitted into the already-open
+    # text block (no thinking block is started).
+    disabled_reasoning_latched = False
 
     # Block index tracking: with reasoning parser we use index 0 for
     # thinking and index 1 for text; without parser, index 0 for text.
@@ -6294,7 +6370,17 @@ async def _stream_anthropic_messages(
             ):
                 continue
 
-            if not use_reasoning:
+            if (
+                reasoning_parser
+                and thinking_off
+                and not disabled_reasoning_latched
+                and _explicit_reasoning_markers_present(
+                    accumulated_text + filtered, reasoning_parser
+                )
+            ):
+                disabled_reasoning_latched = True
+
+            if not (use_reasoning or disabled_reasoning_latched):
                 # Simple path — no reasoning parsing
                 accumulated_text += filtered
                 content_to_emit = filtered
@@ -6363,7 +6449,7 @@ async def _stream_anthropic_messages(
                 else:
                     continue
 
-            if delta_msg.reasoning:
+            if delta_msg.reasoning and not thinking_off:
                 if not thinking_block_started:
                     yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': thinking_index, 'content_block': {'type': 'thinking', 'thinking': ''}})}\n\n"
                     thinking_block_started = True
@@ -6631,6 +6717,19 @@ async def stream_chat_completion(
     # Track accumulated text for reasoning parser
     accumulated_text = ""
 
+    # Raw engine output accumulated across all deltas (the reasoning branch
+    # below only updates accumulated_text when it runs, so it can't serve as
+    # full-stream context). Used as parser context and for the
+    # disabled-thinking marker latch: the streaming counterpart of the
+    # explicit-marker guard in _extract_reasoning_and_tool_calls. With
+    # thinking disabled the parser stays off until the model emits an
+    # explicit reasoning marker; from that point deltas are parsed so raw
+    # markers don't leak into content. Parsed reasoning is suppressed — the
+    # request disabled thinking, so only cleaned content is emitted.
+    raw_stream_text = ""
+    thinking_off = _thinking_disabled(request, kwargs)
+    disabled_reasoning_latched = False
+
     # Track token counts for usage reporting
     prompt_tokens = 0
     completion_tokens = 0
@@ -6671,13 +6770,26 @@ async def stream_chat_completion(
             if hasattr(output, "completion_tokens") and output.completion_tokens:
                 completion_tokens = output.completion_tokens
 
+            if reasoning_parser and delta_text:
+                previous_raw = raw_stream_text
+                raw_stream_text += delta_text
+                if (
+                    thinking_off
+                    and not disabled_reasoning_latched
+                    and _explicit_reasoning_markers_present(
+                        raw_stream_text, reasoning_parser
+                    )
+                ):
+                    disabled_reasoning_latched = True
+
             # Use reasoning parser if enabled (skip when enable_thinking=False
             # is set either on the request or via the resolved chat template
-            # kwargs / server default).
+            # kwargs / server default — unless the disabled-thinking marker
+            # latch above has fired).
             if (
                 reasoning_parser
                 and (delta_text or output_finished)
-                and not _thinking_disabled(request, kwargs)
+                and (not thinking_off or disabled_reasoning_latched)
             ):
                 previous_text = accumulated_text
                 accumulated_text += delta_text
@@ -6712,6 +6824,13 @@ async def stream_chat_completion(
                     if _streaming_tool_markup_possible(_check, tool_parser):
                         content = reasoning
                         reasoning = None
+
+                if thinking_off and reasoning:
+                    # The request disabled thinking — surface only parsed
+                    # content; drop reasoning the model emitted anyway.
+                    reasoning = None
+                    if not content:
+                        continue
 
                 # Tool call parsing on content portion
                 if tool_parser and (
