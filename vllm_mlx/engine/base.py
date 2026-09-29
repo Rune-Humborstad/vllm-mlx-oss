@@ -204,15 +204,17 @@ async def run_blocking_startup_work(
     except asyncio.CancelledError:
         # `task` (e.g. an in-progress model load) must run to completion even
         # though our own caller gave up -- keep re-shielding it, ignoring
-        # further cancels of *this* coroutine, until it's actually done.
-        with suspend_cancellation():
-            while not task.done():
-                try:
-                    await shield_task(task)
-                except asyncio.CancelledError:
-                    continue
-                except Exception:
-                    break  # task's own exception -- already retrieved above
+        # further cancels of *this* coroutine, until it's actually done. Do not
+        # suspend and restore cancellation here: this function re-raises the
+        # original CancelledError below, and restoring it first queues a second
+        # cancellation that can interrupt the caller's cleanup on Python 3.11.
+        while not task.done():
+            try:
+                await shield_task(task)
+            except asyncio.CancelledError:
+                continue
+            except Exception:
+                break  # task's own exception -- already retrieved above
         raise
 
 

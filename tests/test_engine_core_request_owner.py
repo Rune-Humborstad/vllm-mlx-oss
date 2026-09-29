@@ -144,6 +144,56 @@ async def test_cancelled_add_request_waits_for_admission_and_aborts(
 
 
 @pytest.mark.anyio
+async def test_cancelled_start_releases_prepared_model_before_reraising(
+    batched_module,
+):
+    """Drained startup cancellation must not interrupt its own cleanup."""
+    module, _ = batched_module
+    prepare_started = threading.Event()
+    release_prepare = threading.Event()
+
+    engine = object.__new__(module.BatchedEngine)
+    engine._generation_executor = None
+    engine._generation_thread_id = None
+    engine._loaded = False
+    engine._model = None
+    engine._tokenizer = None
+    engine._processor = None
+    engine._engine = None
+    engine._mllm_scheduler = None
+    engine._mllm_instance = None
+    engine._is_mllm = False
+
+    def prepare_for_start():
+        prepare_started.set()
+        assert release_prepare.wait(timeout=5)
+        engine._model = object()
+        engine._tokenizer = object()
+
+    async def unexpected_start_llm():
+        raise AssertionError("_start_llm should not run after cancellation")
+
+    engine.prepare_for_start = prepare_for_start
+    engine._start_llm = unexpected_start_llm
+
+    start_task = asyncio.create_task(engine.start())
+    try:
+        assert await asyncio.to_thread(prepare_started.wait, 5)
+        start_task.cancel()
+        release_prepare.set()
+
+        with pytest.raises(asyncio.CancelledError):
+            await start_task
+
+        assert engine._model is None
+        assert engine._tokenizer is None
+        assert engine._generation_executor is None
+    finally:
+        release_prepare.set()
+        await engine.stop()
+
+
+@pytest.mark.anyio
 async def test_stop_clears_mlx_cache_on_model_owner_thread(batched_module):
     """The final MLX cache flush must happen before its owner worker exits."""
     module, fake_mx = batched_module
