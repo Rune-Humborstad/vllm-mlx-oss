@@ -91,6 +91,7 @@ jobs:
             tests/test_chat_template_safety.py \
             tests/test_simple_engine_thread_pinning.py \
             tests/test_engine_base.py \
+            tests/test_engine_core_request_owner.py \
             tests/test_harmony_parsers.py \
             tests/test_endpoint_model_policies.py \
             tests/test_truncation.py \
@@ -194,6 +195,7 @@ jobs:
         run: |
           python -c "import platform; assert platform.machine() == 'arm64', 'Not ARM64'"
           python -c "import mlx.core as mx; print(f'MLX OK: {mx.default_device()}')"
+          python -m pip show mlx mlx-lm
 
       - name: Run MLX-dependent tests
         run: |
@@ -214,6 +216,7 @@ jobs:
             tests/test_mllm_steps_executed_stat.py \
             tests/test_metrics.py \
             tests/test_optimizations.py \
+            tests/test_batched_engine.py \
             tests/test_simple_engine.py \
             tests/test_simple_engine_prefix_trie_cache.py \
             tests/test_text_model_dispatch.py \
