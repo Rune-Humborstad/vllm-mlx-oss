@@ -399,7 +399,10 @@ async def test_supplied_model_worker_is_not_replaced_by_stream_fallback(monkeypa
 @pytest.mark.anyio
 @pytest.mark.parametrize(
     ("operation", "expected"),
-    [("load_cache_from_disk", 1), ("save_cache_to_disk", True)],
+    [
+        ("_load_cache_from_disk_on_owner", 1),
+        ("_save_cache_to_disk_on_owner", True),
+    ],
 )
 async def test_cache_io_uses_the_model_generation_worker(operation, expected):
     """Persisted MLX cache state must stay on the model owner thread."""
@@ -442,7 +445,10 @@ async def test_cache_io_uses_the_model_generation_worker(operation, expected):
 @pytest.mark.anyio
 @pytest.mark.parametrize(
     ("operation", "expected"),
-    [("load_cache_from_disk", 1), ("save_cache_to_disk", True)],
+    [
+        ("_load_cache_from_disk_on_owner", 1),
+        ("_save_cache_to_disk_on_owner", True),
+    ],
 )
 async def test_mllm_cache_io_stays_on_the_model_event_loop(operation, expected):
     """MLLM cache state follows MLLMScheduler instead of the text worker."""
@@ -537,8 +543,8 @@ async def test_stop_closes_core_on_generation_worker_and_is_repeatable(monkeypat
 
 
 @pytest.mark.anyio
-async def test_stop_retires_generation_worker_when_engine_cleanup_fails(monkeypatch):
-    """A cleanup error must not leave the model-owning executor alive."""
+async def test_stop_failure_preserves_generation_worker_for_retry(monkeypatch):
+    """A retryable cleanup error must retain the engine and its owner."""
     from vllm_mlx.engine.batched import BatchedEngine
 
     close_threads: list[int] = []
@@ -547,15 +553,19 @@ async def test_stop_retires_generation_worker_when_engine_cleanup_fails(monkeypa
         def close(self):
             close_threads.append(threading.get_ident())
 
-    class FailingAsyncEngine:
+    class FailingOnceAsyncEngine:
         engine = FakeCore()
+        stop_calls = 0
 
         async def stop(self):
-            raise RuntimeError("engine cleanup failed")
+            self.stop_calls += 1
+            if self.stop_calls == 1:
+                raise RuntimeError("engine cleanup failed")
 
     engine = object.__new__(BatchedEngine)
     engine._generation_executor = None
-    engine._engine = FailingAsyncEngine()
+    async_engine = FailingOnceAsyncEngine()
+    engine._engine = async_engine
     engine._mllm_scheduler = None
     engine._model = object()
     engine._tokenizer = object()
@@ -569,10 +579,91 @@ async def test_stop_retires_generation_worker_when_engine_cleanup_fails(monkeypa
     with pytest.raises(RuntimeError, match="engine cleanup failed"):
         await engine.stop()
 
+    assert close_threads == []
+    assert engine._engine is async_engine
+    assert engine._loaded is True
+    assert worker.submit(threading.get_ident).result() == owner_thread
+
+    await engine.stop()
+
     assert close_threads == [owner_thread]
+    assert engine._engine is None
     assert engine._generation_executor is None
     with pytest.raises(RuntimeError, match="cannot schedule new futures"):
         worker.submit(lambda: None)
+
+
+@pytest.mark.anyio
+async def test_cancelled_stop_drains_owner_cleanup_before_retry(monkeypatch):
+    """Cancellation cannot skip a queued owner-thread close operation."""
+    from vllm_mlx.engine.batched import BatchedEngine
+
+    close_threads: list[int] = []
+    blocker_started = threading.Event()
+    release_blocker = threading.Event()
+    close_submitted = asyncio.Event()
+
+    class FakeCore:
+        closed = False
+
+        def close(self):
+            if self.closed:
+                return
+            self.closed = True
+            close_threads.append(threading.get_ident())
+
+    class FakeAsyncEngine:
+        engine = FakeCore()
+
+        async def stop(self):
+            pass
+
+    engine = object.__new__(BatchedEngine)
+    engine._generation_executor = None
+    async_engine = FakeAsyncEngine()
+    engine._engine = async_engine
+    engine._mllm_scheduler = None
+    engine._model = object()
+    engine._tokenizer = object()
+    engine._processor = None
+    engine._mllm_instance = None
+    engine._loaded = True
+    worker = engine._generation_worker()
+    owner_thread = worker.submit(threading.get_ident).result()
+
+    def block_worker():
+        blocker_started.set()
+        assert release_blocker.wait(timeout=5)
+
+    worker.submit(block_worker)
+    assert await asyncio.to_thread(blocker_started.wait, 5)
+
+    loop = asyncio.get_running_loop()
+    original_run_in_executor = loop.run_in_executor
+
+    def track_close_submission(executor, operation, *args):
+        future = original_run_in_executor(executor, operation, *args)
+        if operation == async_engine.engine.close:
+            close_submitted.set()
+        return future
+
+    monkeypatch.setattr(loop, "run_in_executor", track_close_submission)
+
+    stop_task = asyncio.create_task(engine.stop())
+    await asyncio.wait_for(close_submitted.wait(), timeout=5)
+    stop_task.cancel()
+    release_blocker.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await stop_task
+
+    assert close_threads == [owner_thread]
+    assert engine._engine is async_engine
+    assert worker.submit(threading.get_ident).result() == owner_thread
+
+    await engine.stop()
+    assert engine._engine is None
+    assert engine._generation_executor is None
 
 
 def test_async_engine_core_passes_the_worker_through():

@@ -189,7 +189,7 @@ async def shield_task(task: asyncio.Task) -> Any:
 
 async def run_blocking_startup_work(
     work: Callable[[], Any], executor: Any | None = None
-) -> None:
+) -> Any:
     """Run blocking startup work off-loop without leaking cancellation races.
 
     Pass ``executor`` to pin the work to a specific thread. MLX buffers carry
@@ -200,7 +200,7 @@ async def run_blocking_startup_work(
     loop = asyncio.get_running_loop()
     task = asyncio.ensure_future(loop.run_in_executor(executor, work))
     try:
-        await shield_task(task)
+        return await shield_task(task)
     except asyncio.CancelledError:
         # `task` (e.g. an in-progress model load) must run to completion even
         # though our own caller gave up -- keep re-shielding it, ignoring
