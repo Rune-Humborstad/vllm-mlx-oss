@@ -512,7 +512,7 @@ def test_extract_reasoning_parses_explicit_markers_when_thinking_disabled():
 
     assert tool_calls is None
     assert content == "The answer is 42."
-    assert reasoning and "Let me think." in reasoning
+    assert reasoning is None
     assert "<|channel>" not in content and "<channel|>" not in content
 
 
@@ -530,6 +530,20 @@ def test_extract_reasoning_stays_disabled_without_markers():
 
     assert reasoning is None
     assert content == "Plain answer."
+
+
+def test_extract_reasoning_stays_disabled_for_lone_end_marker():
+    saved = srv._reasoning_parser
+    srv._reasoning_parser = _gemma_parser()
+    try:
+        reasoning, content, _ = srv._extract_reasoning_and_tool_calls(
+            "Before <channel|> after", None, allow_reasoning=False
+        )
+    finally:
+        srv._reasoning_parser = saved
+
+    assert reasoning is None
+    assert content == "Before <channel|> after"
 
 
 @pytest.mark.anyio

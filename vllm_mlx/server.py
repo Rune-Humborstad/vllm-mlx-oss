@@ -3157,8 +3157,8 @@ def _responses_sse_event(event_type: str, payload: BaseModel | dict) -> str:
 
 def _explicit_reasoning_markers_present(text: str, parser=None) -> bool:
     """
-    True when the active reasoning parser's explicit start/end markers
-    appear in ``text``.
+    True when the active reasoning parser's explicit start marker appears
+    in ``text``.
 
     The allow_reasoning gate (PR #537) exists to keep implicit-thinking
     parsers from swallowing plain content into reasoning when thinking is
@@ -3173,8 +3173,7 @@ def _explicit_reasoning_markers_present(text: str, parser=None) -> bool:
     if not active_parser:
         return False
     start = getattr(active_parser, "start_token", None)
-    end = getattr(active_parser, "end_token", None)
-    return bool((start and start in text) or (end and end in text))
+    return bool(start and start in text)
 
 
 _HARMONY_ANALYSIS_BLOCK_RE = re.compile(
@@ -3210,7 +3209,8 @@ def _extract_reasoning_and_tool_calls(
     reasoning_text = None
     text_for_tool_parse = output_text
 
-    if _reasoning_parser and not allow_reasoning:
+    suppress_reasoning = not allow_reasoning
+    if _reasoning_parser and suppress_reasoning:
         # Thinking is disabled, but the model opened an explicit reasoning
         # block anyway — parse iff markers are present (see
         # _explicit_reasoning_markers_present).
@@ -3233,6 +3233,10 @@ def _extract_reasoning_and_tool_calls(
                 text_for_tool_parse = _strip_harmony_analysis_blocks(output_text)
             else:
                 text_for_tool_parse = ""
+        if suppress_reasoning:
+            # Keep the cleaned answer, but do not expose thoughts emitted
+            # despite enable_thinking=False.
+            reasoning_text = None
 
     # Skip tool parsing when the request defines no tools — otherwise the
     # parser can misinterpret JSON output (e.g. response_format) as tool calls.
