@@ -88,6 +88,9 @@ jobs:
             tests/test_request.py \
             tests/test_anthropic_models.py \
             tests/test_anthropic_adapter.py \
+            tests/test_anthropic_adapter_images.py \
+            tests/test_mllm_assistant_images.py \
+            tests/test_mllm_message_ordering.py \
             tests/test_anthropic_adapter_canonicalization.py \
             tests/test_dependency_floors.py \
             tests/test_ssd_cache_shutdown.py \
@@ -219,6 +222,7 @@ jobs:
             tests/test_mllm_continuous_batching.py \
             tests/test_mllm_cache.py \
             tests/test_mllm_sampling.py \
+            tests/test_mllm_assistant_images.py \
             tests/test_mllm_steps_executed_stat.py \
             tests/test_metrics.py \
             tests/test_optimizations.py \
