@@ -1291,21 +1291,30 @@ class TestGlm4Parser:
 
     # Streaming tests
 
-    def test_streaming_no_tags_emits_reasoning(self, parser):
-        """GLM-4.7 injects <think> in the prompt, so tag-less streaming
-        output is implicit reasoning (thinking-disabled requests bypass
-        the parser server-side and are not affected)."""
+    def test_streaming_no_tags_emits_content(self, parser):
+        """Autonomous GLM output without tags stays in the content channel."""
         parser.reset_state()
+        result = parser.extract_reasoning_streaming("", "Hello", "Hello")
+        assert result is not None
+        assert result.content == "Hello"
+        assert result.reasoning is None
+
+    def test_streaming_implicit_mode_no_tags_emits_reasoning(self, parser):
+        """An injected opening tag puts initial output in the reasoning channel."""
+        parser.reset_state(implicit_mode=True)
         result = parser.extract_reasoning_streaming("", "Hello", "Hello")
         assert result is not None
         assert result.reasoning == "Hello"
         assert result.content is None
 
-    def test_streaming_implicit_close_splits_reasoning_and_content(self, parser):
-        """Only </think> in output (GLM-4.7 shape): reasoning before the
-        tag, content after — nothing leaks across."""
-        parser.reset_state()
-        tokens = ["thinking a", "bout it", "</think>", "the answer"]
+    @pytest.mark.parametrize("chunk_size", [1, 5, 7])
+    def test_streaming_implicit_close_splits_reasoning_and_content(
+        self, parser, chunk_size
+    ):
+        """Prompt-seeded reasoning ends cleanly even when the closing tag splits."""
+        parser.reset_state(implicit_mode=True)
+        output = "thinking about it</think>the answer"
+        tokens = [output[i : i + chunk_size] for i in range(0, len(output), chunk_size)]
         accumulated = ""
         reasoning_parts, content_parts = [], []
         for token in tokens:
@@ -1319,6 +1328,10 @@ class TestGlm4Parser:
                     content_parts.append(result.content)
         assert "".join(reasoning_parts) == "thinking about it"
         assert "".join(content_parts) == "the answer"
+        assert parser.extract_reasoning(output) == (
+            "".join(reasoning_parts),
+            "".join(content_parts),
+        )
 
     def test_streaming_with_thinking(self, parser):
         """Test streaming with think tags."""
@@ -1348,17 +1361,19 @@ class TestGlm4Parser:
 
         tokens = ["<|begin_of_box|>", "Paris", "<|end_of_box|>"]
         accumulated = ""
-        parts = []
+        content_parts = []
 
         for token in tokens:
             prev = accumulated
             accumulated += token
             result = parser.extract_reasoning_streaming(prev, accumulated, token)
             if result:
-                parts.append((result.reasoning or "") + (result.content or ""))
+                assert result.reasoning is None
+                if result.content:
+                    content_parts.append(result.content)
 
-        full = "".join(parts)
-        assert "Paris" in full
+        full = "".join(content_parts)
+        assert full == "Paris"
         assert "<|begin_of_box|>" not in full
         assert "<|end_of_box|>" not in full
 
@@ -1554,3 +1569,165 @@ class TestGemma4DegenerateCycling:
         # Channel tokens must not leak
         assert "<channel|>" not in full_content
         assert "<|channel>" not in full_content
+
+
+class TestSplitTagStreaming:
+    """Tags that arrive split across deltas must not leak or be lost.
+
+    A model whose tokenizer has ``</think>`` as a single token never produces
+    this, which is why it went unnoticed; one that spells the tag out in
+    ordinary tokens produces it on every reasoning turn.
+    """
+
+    @staticmethod
+    def _stream(parser, text, chunk):
+        parser.reset_state()
+        accumulated, reasoning, content = "", [], []
+        for i in range(0, len(text), chunk):
+            delta = text[i : i + chunk]
+            previous, accumulated = accumulated, accumulated + delta
+            message = parser.extract_reasoning_streaming(previous, accumulated, delta)
+            if message is not None:
+                if message.reasoning:
+                    reasoning.append(message.reasoning)
+                if message.content:
+                    content.append(message.content)
+        message = parser.finalize_stream()
+        if message is not None:
+            if message.reasoning:
+                reasoning.append(message.reasoning)
+            if message.content:
+                content.append(message.content)
+        return "".join(reasoning), "".join(content)
+
+    @pytest.fixture(params=["qwen3", "deepseek_r1"])
+    def parser(self, request):
+        return get_parser(request.param)()
+
+    @pytest.mark.parametrize("chunk", [1, 2, 3, 4, 5, 6, 7, 16])
+    def test_split_end_tag_does_not_leak(self, parser, chunk):
+        """No fragment of </think> may surface as reasoning."""
+        reasoning, content = self._stream(parser, "weighing it</think>Answer.", chunk)
+        assert reasoning.strip() == "weighing it"
+        assert content.strip() == "Answer."
+        for fragment in ("<", "/", "think", ">"):
+            assert fragment not in reasoning
+
+    @pytest.mark.parametrize("chunk", [1, 2, 3, 5])
+    def test_split_start_tag_does_not_leak(self, parser, chunk):
+        reasoning, content = self._stream(
+            parser, "<think>weighing it</think>Answer.", chunk
+        )
+        assert reasoning.strip() == "weighing it"
+        assert content.strip() == "Answer."
+        assert "<think>" not in reasoning
+        assert "<think>" not in content
+
+    @pytest.mark.parametrize(
+        "text", ["thinking<", "thinking</", "thinking</thi", "thinking</think"]
+    )
+    def test_truncated_tag_prefix_is_still_delivered(self, parser, text):
+        """Withheld text must be flushed when the stream ends without the tag."""
+        reasoning, content = self._stream(parser, text, 3)
+        assert len(reasoning) + len(content) == len(text)
+
+    @pytest.mark.parametrize("chunk", [1, 3, 7])
+    def test_nothing_is_lost(self, parser, chunk):
+        text = "weighing it</think>Answer."
+        reasoning, content = self._stream(parser, text, chunk)
+        # The tag itself is a delimiter, not content of either channel.
+        assert len(reasoning) + len(content) == len(text) - len("</think>")
+
+
+class TestStreamingCostIsFlat:
+    """Per-token cost must not grow with output length.
+
+    The parser used to search the whole accumulated text on every delta, which
+    is O(N²) over a generation — invisible on short replies, dominant on long
+    ones.
+    """
+
+    @staticmethod
+    def _elapsed_ms(parser, n_tokens):
+        import time
+
+        parser.reset_state()
+        tokens = (
+            [f"step{i} " for i in range(n_tokens)]
+            + ["</think>"]
+            + [f"word{i} " for i in range(10)]
+        )
+        accumulated = ""
+        start = time.perf_counter()
+        for delta in tokens:
+            previous, accumulated = accumulated, accumulated + delta
+            parser.extract_reasoning_streaming(previous, accumulated, delta)
+        return (time.perf_counter() - start) * 1000
+
+    @pytest.fixture(params=["qwen3", "deepseek_r1"])
+    def parser(self, request):
+        return get_parser(request.param)()
+
+    def test_scales_linearly(self, parser):
+        """20x the tokens must cost well under 20x^2 the time."""
+        small = self._elapsed_ms(parser, 250)
+        large = self._elapsed_ms(parser, 5000)
+        # Linear would be 20x. Allow generous headroom for timer noise on a
+        # loaded CI machine while still failing loudly on quadratic growth,
+        # which measured over 1000x before the fix.
+        assert large < small * 200, (
+            f"{small:.2f}ms at 250 tokens, {large:.2f}ms at 5000 — "
+            "per-token cost is growing with output length"
+        )
+
+
+class TestForcedThinkingStreaming:
+    """GLM-5.3's template injects an open <think>, so the model output begins
+    INSIDE the reasoning block and only ever emits the closing </think>.
+
+    The glm4 streaming parser assumed GLM-4.6-style autonomous thinking and
+    defaulted pre-</think> output to content, so the whole chain-of-thought
+    landed in ``content`` glued to the answer. Live capture on GLM-5.3:
+
+        streaming:     content='84 * 3 = 252\\n252 / 2 = 126**126**'
+                       reasoning_content=''
+        non-streaming: content='**126**'
+                       reasoning_content='84 * 3 / 2 = 252 / 2 = 126'
+    """
+
+    DELTAS = ["84 * 3 = 252\n", "252 / 2 = 126", "</think>", "**126**"]
+
+    def _run(self, parser):
+        reasoning, content = [], []
+        prev = ""
+        for d in self.DELTAS:
+            cur = prev + d
+            msg = parser.extract_reasoning_streaming(prev, cur, d)
+            if msg is not None:
+                if getattr(msg, "reasoning", None):
+                    reasoning.append(msg.reasoning)
+                if getattr(msg, "content", None):
+                    content.append(msg.content)
+            prev = cur
+        return "".join(reasoning), "".join(content)
+
+    def test_implicit_mode_routes_pre_close_text_to_reasoning(self):
+        from vllm_mlx.reasoning import get_parser
+
+        parser = get_parser("glm4")(None)
+        parser.reset_state(implicit_mode=True)
+        reasoning, content = self._run(parser)
+
+        assert reasoning == "84 * 3 = 252\n252 / 2 = 126"
+        assert content == "**126**"
+
+    def test_autonomous_mode_still_defaults_to_content(self):
+        """Without a forced <think>, GLM-4.6-style output is plain content."""
+        from vllm_mlx.reasoning import get_parser
+
+        parser = get_parser("glm4")(None)
+        parser.reset_state()
+        reasoning, content = self._run(parser)
+
+        assert reasoning == ""
+        assert content == "84 * 3 = 252\n252 / 2 = 126**126**"

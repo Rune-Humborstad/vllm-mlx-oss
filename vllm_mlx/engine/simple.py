@@ -15,9 +15,9 @@ import threading
 import time
 import uuid
 from collections import OrderedDict, deque
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import asynccontextmanager
+from contextlib import aclosing, asynccontextmanager
 from typing import Any
 
 # Re-entrancy guard for SimpleEngine._track_request_stream so that
@@ -1011,6 +1011,26 @@ class SimpleEngine(BaseEngine):
                     self._text_tokenizer.convert_tokens_to_ids("<|im_end|>")
                 )
 
+            # Wrap with the full EOS set (tokenizer attrs + config.json +
+            # generation_config.json). Passing the raw HF tokenizer to
+            # mlx_lm.stream_generate makes it wrap with
+            # eos_token_ids={tokenizer.eos_token_id}, dropping turn terminators
+            # declared only in the config EOS list (Gemma 4's <turn|>=106,
+            # <|tool_response>=50) — the model then generates straight through
+            # end-of-turn until max_tokens. The hard-coded Qwen3.5 patch above
+            # is this same bug, fixed per-model. Mirrors MLLMScheduler
+            # stop-token handling on the batched path.
+            from mlx_lm.tokenizer_utils import TokenizerWrapper
+
+            from ..utils.tokenizer import collect_eos_token_ids
+
+            eos_ids = collect_eos_token_ids(self._text_tokenizer)
+            self._text_tokenizer = TokenizerWrapper(
+                self._text_tokenizer,
+                eos_token_ids=eos_ids or None,
+            )
+            logger.info("Text route stop tokens: %s", sorted(eos_ids))
+
             # Probe the derived TextModel's prompt cache for snapshot-safety.
             # Probe args match _stream_generate_text's cache construction so a
             # bounded-KV route cannot be misclassified as snapshot-safe.
@@ -1206,10 +1226,10 @@ class SimpleEngine(BaseEngine):
 
     async def _track_request_stream(
         self,
-        source_gen: AsyncIterator[GenerationOutput],
+        source_gen: AsyncGenerator[GenerationOutput, None],
         *,
         max_tokens: int = 0,
-    ) -> AsyncIterator[GenerationOutput]:
+    ) -> AsyncGenerator[GenerationOutput, None]:
         """Yield-through wrapper that records per-request live state and
         final ``prompt_tokens``/``completion_tokens`` counters.
 
@@ -1235,8 +1255,9 @@ class SimpleEngine(BaseEngine):
         consumed inside this method, so there is no value to preserve.
         """
         if _in_tracker.get():
-            async for output in source_gen:
-                yield output
+            async with aclosing(source_gen):
+                async for output in source_gen:
+                    yield output
             return
         _in_tracker.set(True)
         request_id = str(uuid.uuid4())
@@ -1261,25 +1282,29 @@ class SimpleEngine(BaseEngine):
         self._active_requests[request_id] = entry
         self._num_running += 1
         try:
-            async for output in source_gen:
-                now = time.time()
-                if hasattr(output, "prompt_tokens") and output.prompt_tokens:
-                    last_p = output.prompt_tokens
-                    entry["prompt_tokens"] = last_p
-                if hasattr(output, "completion_tokens") and output.completion_tokens:
-                    if ttft_s is None:
-                        ttft_s = now - start
-                        entry["ttft_s"] = round(ttft_s, 3)
-                        entry["phase"] = "generation"
-                    last_c = output.completion_tokens
-                    entry["completion_tokens"] = last_c
-                entry["elapsed_s"] = round(now - start, 2)
-                if max_tokens > 0:
-                    entry["progress"] = round(min(1.0, last_c / max_tokens), 3)
-                if ttft_s is not None and last_c > 0:
-                    gen_elapsed = max(1e-3, (now - start) - ttft_s)
-                    entry["tokens_per_second"] = round(last_c / gen_elapsed, 1)
-                yield output
+            async with aclosing(source_gen):
+                async for output in source_gen:
+                    now = time.time()
+                    if hasattr(output, "prompt_tokens") and output.prompt_tokens:
+                        last_p = output.prompt_tokens
+                        entry["prompt_tokens"] = last_p
+                    if (
+                        hasattr(output, "completion_tokens")
+                        and output.completion_tokens
+                    ):
+                        if ttft_s is None:
+                            ttft_s = now - start
+                            entry["ttft_s"] = round(ttft_s, 3)
+                            entry["phase"] = "generation"
+                        last_c = output.completion_tokens
+                        entry["completion_tokens"] = last_c
+                    entry["elapsed_s"] = round(now - start, 2)
+                    if max_tokens > 0:
+                        entry["progress"] = round(min(1.0, last_c / max_tokens), 3)
+                    if ttft_s is not None and last_c > 0:
+                        gen_elapsed = max(1e-3, (now - start) - ttft_s)
+                        entry["tokens_per_second"] = round(last_c / gen_elapsed, 1)
+                    yield output
         finally:
             self._active_requests.pop(request_id, None)
             self._num_running = max(0, self._num_running - 1)
@@ -1299,9 +1324,9 @@ class SimpleEngine(BaseEngine):
         top_p: float = 0.9,
         stop: list[str] | None = None,
         **kwargs,
-    ) -> AsyncIterator[GenerationOutput]:
+    ) -> AsyncGenerator[GenerationOutput, None]:
         """Public stream-generate wrapper with request stats tracking."""
-        async for output in self._track_request_stream(
+        tracked_stream = self._track_request_stream(
             self._stream_generate_impl(
                 prompt=prompt,
                 max_tokens=max_tokens,
@@ -1311,8 +1336,10 @@ class SimpleEngine(BaseEngine):
                 **kwargs,
             ),
             max_tokens=max_tokens,
-        ):
-            yield output
+        )
+        async with aclosing(tracked_stream):
+            async for output in tracked_stream:
+                yield output
 
     async def _stream_generate_impl(
         self,
@@ -1322,7 +1349,7 @@ class SimpleEngine(BaseEngine):
         top_p: float = 0.9,
         stop: list[str] | None = None,
         **kwargs,
-    ) -> AsyncIterator[GenerationOutput]:
+    ) -> AsyncGenerator[GenerationOutput, None]:
         """
         Stream generation token by token.
 
@@ -1379,7 +1406,7 @@ class SimpleEngine(BaseEngine):
                     use_specprefill = False
 
                 if use_specprefill:
-                    async for output in self._stream_generate_specprefill(
+                    specprefill_stream = self._stream_generate_specprefill(
                         prompt,
                         tokens_list,
                         max_tokens,
@@ -1389,8 +1416,10 @@ class SimpleEngine(BaseEngine):
                         specprefill_keep_pct=specprefill_keep_pct_override,
                         specprefill_backbone_pct=specprefill_backbone_pct_override,
                         **kwargs,
-                    ):
-                        yield output
+                    )
+                    async with aclosing(specprefill_stream):
+                        async for output in specprefill_stream:
+                            yield output
                     return
 
         async with self._acquire_generation_slot(request_id):
@@ -1625,6 +1654,7 @@ class SimpleEngine(BaseEngine):
                 messages=messages,
                 max_tokens=max_tokens,
                 temperature=temperature,
+                top_p=top_p,
                 tools=template_tools,
                 **kwargs,
             )
@@ -1678,9 +1708,9 @@ class SimpleEngine(BaseEngine):
         images: list[str] | None = None,
         videos: list[str] | None = None,
         **kwargs,
-    ) -> AsyncIterator[GenerationOutput]:
+    ) -> AsyncGenerator[GenerationOutput, None]:
         """Public stream-chat wrapper with request stats tracking."""
-        async for output in self._track_request_stream(
+        tracked_stream = self._track_request_stream(
             self._stream_chat_impl(
                 messages=messages,
                 max_tokens=max_tokens,
@@ -1692,8 +1722,10 @@ class SimpleEngine(BaseEngine):
                 **kwargs,
             ),
             max_tokens=max_tokens,
-        ):
-            yield output
+        )
+        async with aclosing(tracked_stream):
+            async for output in tracked_stream:
+                yield output
 
     async def _stream_chat_impl(
         self,
@@ -1705,7 +1737,7 @@ class SimpleEngine(BaseEngine):
         images: list[str] | None = None,
         videos: list[str] | None = None,
         **kwargs,
-    ) -> AsyncIterator[GenerationOutput]:
+    ) -> AsyncGenerator[GenerationOutput, None]:
         """
         Stream chat completion token by token.
 
@@ -1751,19 +1783,22 @@ class SimpleEngine(BaseEngine):
             logger.info("Text-only request → LLM path (MTP=%s)", has_mtp and self._mtp)
             if chat_template_kwargs:
                 kwargs["chat_template_kwargs"] = chat_template_kwargs
-            async for chunk in self._stream_generate_text(
+            text_stream = self._stream_generate_text(
                 messages,
                 max_tokens,
                 temperature,
                 top_p,
                 tools=template_tools,
                 **kwargs,
-            ):
-                yield chunk
+            )
+            async with aclosing(text_stream):
+                async for chunk in text_stream:
+                    yield chunk
             return
 
         def mllm_call_kwargs() -> dict:
             local_kwargs = dict(kwargs)
+            local_kwargs["top_p"] = top_p
             if chat_template_kwargs:
                 local_kwargs["chat_template_kwargs"] = chat_template_kwargs
             local_kwargs["mllm_draft"] = mllm_draft_requested
@@ -2359,7 +2394,11 @@ class SimpleEngine(BaseEngine):
                         break
             finally:
                 if not producer_task.done():
-                    abort_event.set()
+                    # The terminal chunk can arrive before the worker stores
+                    # the completed prefix. Let normal completion finish;
+                    # only an incomplete stream should abort the producer.
+                    if not finished:
+                        abort_event.set()
                     try:
                         await producer_task
                     except BaseException:
@@ -2369,26 +2408,30 @@ class SimpleEngine(BaseEngine):
                 # Internal fallback to the public stream_generate. The
                 # ``_in_tracker`` context flag prevents double counting
                 # in _track_request_stream.
-                async for output in self.stream_generate(
+                fallback_stream = self.stream_generate(
                     prompt=prompt,
                     max_tokens=max_tokens,
                     temperature=temperature,
                     top_p=top_p,
                     **kwargs,
-                ):
-                    yield output
+                )
+                async with aclosing(fallback_stream):
+                    async for output in fallback_stream:
+                        yield output
             return
 
         # Fallback: no system prefix detected -> original uncached path.
         # Re-entrancy guard in _track_request_stream keeps stats single-counted.
-        async for output in self.stream_generate(
+        fallback_stream = self.stream_generate(
             prompt=prompt,
             max_tokens=max_tokens,
             temperature=temperature,
             top_p=top_p,
             **kwargs,
-        ):
-            yield output
+        )
+        async with aclosing(fallback_stream):
+            async for output in fallback_stream:
+                yield output
 
     async def _stream_generate_specprefill(
         self,
@@ -2401,7 +2444,7 @@ class SimpleEngine(BaseEngine):
         specprefill_keep_pct: float | None = None,
         specprefill_backbone_pct: float | None = None,
         **kwargs,
-    ) -> AsyncIterator[GenerationOutput]:
+    ) -> AsyncGenerator[GenerationOutput, None]:
         """SpecPrefill path for non-MTP models (Nemotron, GPT-OSS, etc).
 
         Scores token importance with the draft model, sparse-prefills the target
@@ -2604,7 +2647,7 @@ class SimpleEngine(BaseEngine):
         top_p: float,
         tools: list | None = None,
         **kwargs,
-    ) -> AsyncIterator[GenerationOutput]:
+    ) -> AsyncGenerator[GenerationOutput, None]:
         """Text-only generation via mlx_lm TextModel.
 
         Used when text-only MLLM routing is active and the request has no media.
@@ -2686,11 +2729,9 @@ class SimpleEngine(BaseEngine):
         prompt_to_send = full_prompt  # Default: send full prompt text
         cache_hit = False
         system_token_count = 0
-        full_token_count = 0
         system_hash = None
         system_tokens = None
         suffix_tokens = None
-        full_tokens_list = None
         cache_blocking_controls = []
         if not self._supports_system_kv_cache:
             cache_blocking_controls.append("non_kv_cache_class")
@@ -2701,6 +2742,18 @@ class SimpleEngine(BaseEngine):
                 "uncached path",
                 cache_blocking_controls,
             )
+
+        # Tokenize the full prompt up front so usage.prompt_tokens is always
+        # reported. Previously this only happened inside the system-KV-cache
+        # branch (which requires a system message AND ChatML markers) or for
+        # specprefill — every other request reported prompt_tokens=0.
+        _add_special = self._text_tokenizer.bos_token is None or not (
+            full_prompt.startswith(self._text_tokenizer.bos_token)
+        )
+        full_tokens_list = self._text_tokenizer.encode(
+            full_prompt, add_special_tokens=_add_special
+        )
+        full_token_count = len(full_tokens_list)
 
         # Extract system messages for caching
         has_system = any(m.get("role") == "system" for m in messages)
@@ -2722,18 +2775,10 @@ class SimpleEngine(BaseEngine):
                     :16
                 ]
 
-                # Tokenize both (matching stream_generate's tokenization logic)
-                tokenizer = self._text_tokenizer
-                add_special = tokenizer.bos_token is None or not full_prompt.startswith(
-                    tokenizer.bos_token
-                )
-                full_tokens_list = tokenizer.encode(
-                    full_prompt, add_special_tokens=add_special
-                )
-                full_token_count = len(full_tokens_list)
-
-                system_tokens_list = tokenizer.encode(
-                    system_prefix_text, add_special_tokens=add_special
+                # Tokenize the system prefix (full prompt is tokenized above,
+                # matching stream_generate's tokenization logic)
+                system_tokens_list = self._text_tokenizer.encode(
+                    system_prefix_text, add_special_tokens=_add_special
                 )
                 system_token_count = len(system_tokens_list)
 
@@ -2818,18 +2863,8 @@ class SimpleEngine(BaseEngine):
         else:
             use_specprefill = self._draft_model is not None
 
-        # For specprefill, ensure we have token IDs (not just prompt text)
-        if use_specprefill and suffix_tokens is None and full_tokens_list is None:
-            tokenizer = self._text_tokenizer
-            add_special = tokenizer.bos_token is None or not full_prompt.startswith(
-                tokenizer.bos_token
-            )
-            full_tokens_list = tokenizer.encode(
-                full_prompt, add_special_tokens=add_special
-            )
-            full_token_count = len(full_tokens_list)
-
         # Tokens for specprefill: suffix (if system KV) or full prompt
+        # (full_tokens_list is always populated by the up-front tokenization)
         specprefill_tokens = (
             suffix_tokens if suffix_tokens is not None else full_tokens_list
         )

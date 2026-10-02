@@ -3,11 +3,11 @@
 Reasoning parser for GLM-4 models (GLM-4.5-Air, GLM-4.6V, GLM-4.7, etc.).
 
 GLM-4 uses <think>...</think> tags for reasoning content, same as Qwen3.
-GLM-4.7's chat template injects <think> in the prompt when thinking is
-enabled (and a pre-closed </think> when disabled), so model output with
-thinking on carries only the closing tag — implicit reasoning mode, like
-Qwen3. Thinking-disabled requests bypass reasoning parsing server-side
-(``_thinking_disabled``), so no-tag output is not misclassified.
+The prompt format depends on the chat template. GLM-4.7 injects an open
+<think> when thinking is enabled and a closing </think> when disabled.
+The server detects an injected opening tag and enables implicit reasoning
+for that request's streaming parser. Without that signal, untagged streaming
+output remains normal content.
 
 GLM-4.6V also wraps responses in <|begin_of_box|>...<|end_of_box|> container
 tags which must be stripped before returning content.
@@ -25,13 +25,13 @@ class Glm4ReasoningParser(BaseThinkingReasoningParser):
     Reasoning parser for GLM-4 models.
 
     GLM-4 uses <think>...</think> tokens to denote reasoning text.
-    Unlike Qwen3, the template does NOT inject <think> in the prompt,
-    so output without tags is a normal response (not truncated reasoning).
+    Untagged streaming output is normal content by default. A template that
+    injects an opening tag enables implicit reasoning for that stream.
 
     Supports three scenarios:
     1. Both tags in output: <think>reasoning</think>content
     2. Only closing tag (think in prompt): reasoning</think>content
-    3. No tags: pure content (NOT reasoning)
+    3. No tags: pure content in complete output and autonomous streams
 
     Example (with thinking):
         Input: "<think>Let me analyze...</think>The answer is 42."
@@ -66,24 +66,52 @@ class Glm4ReasoningParser(BaseThinkingReasoningParser):
         """
         Extract reasoning from streaming delta.
 
-        GLM-4.7's chat template injects ``<think>`` at the end of the
-        generation prompt when thinking is enabled (and a pre-closed
-        ``</think>`` when disabled), so with thinking on the model output
-        contains only the CLOSING tag — the base class's implicit-reasoning
-        mode (default to reasoning until ``</think>``) is exactly right.
-        Thinking-disabled requests never reach this parser: the server
-        bypasses reasoning parsing via ``_thinking_disabled``, so plain
-        content is not at risk of being swallowed into reasoning.
+        When no tags have been seen, emit the delta as content unless the
+        request's template injected an opening tag. With implicit reasoning
+        enabled, delegate to the base parser until the closing tag arrives.
 
-        (An earlier version assumed GLM-4 never injects ``<think>`` and
-        emitted pre-tag deltas as content; on GLM-4.7 that streamed the
-        entire thinking block into ``content``.)
+        Once <think> is seen, delegates to base class state machine.
         """
         # Strip GLM-4.6V box container tags (special tokens, always whole)
         delta_text = delta_text.replace(_BOX_START, "").replace(_BOX_END, "")
         if not delta_text:
             return None
 
+        start_tok = self.start_token
+        end_tok = self.end_token
+
+        # In pre_think phase: check if we should treat as content
+        if self._phase == "pre_think":
+            # If start tag appeared, transition to thinking via base class
+            if start_tok in current_text:
+                return super().extract_reasoning_streaming(
+                    previous_text, current_text, delta_text
+                )
+
+            # If end tag appeared without start (implicit mode from agent)
+            if end_tok in current_text:
+                return super().extract_reasoning_streaming(
+                    previous_text, current_text, delta_text
+                )
+
+            # No tags yet. Autonomous GLM-4.6-style output is content, but a
+            # template that injected an open <think> (GLM-5.2/5.3) starts the
+            # model INSIDE the reasoning block, so untagged text is reasoning
+            # until </think> arrives. Without this the whole chain-of-thought
+            # is emitted as content, glued to the answer.
+            #
+            # This does not make streaming agree with extract_reasoning() in
+            # every case: the non-streaming path has no implicit-mode signal,
+            # so output truncated before </think> still lands in content there
+            # and in reasoning here. Fixing that needs the flag threaded into
+            # extract_reasoning() as well.
+            if self._implicit_mode:
+                return super().extract_reasoning_streaming(
+                    previous_text, current_text, delta_text
+                )
+            return DeltaMessage(content=delta_text)
+
+        # In thinking or content phase, delegate to base class
         return super().extract_reasoning_streaming(
             previous_text, current_text, delta_text
         )
