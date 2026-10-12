@@ -10,6 +10,8 @@ Tests cover:
 - Edge cases (no tags, partial tags, etc.)
 """
 
+import re
+
 import pytest
 
 from vllm_mlx.reasoning import (
@@ -1384,6 +1386,130 @@ class TestGlm4Parser:
             "", "<|begin_of_box|>", "<|begin_of_box|>"
         )
         assert result is None
+
+    # Streaming / complete-output parity
+
+    @staticmethod
+    def _stream(parser, deltas):
+        """Feed deltas through the streaming parser; return the joined channels."""
+        accumulated = ""
+        reasoning_parts, content_parts = [], []
+        for delta in deltas:
+            prev = accumulated
+            accumulated += delta
+            result = parser.extract_reasoning_streaming(prev, accumulated, delta)
+            if result:
+                if result.reasoning:
+                    reasoning_parts.append(result.reasoning)
+                if result.content:
+                    content_parts.append(result.content)
+        return ("".join(reasoning_parts) or None, "".join(content_parts) or None)
+
+    @staticmethod
+    def _chunk(output, size):
+        """Split output into deltas of `size` chars.
+
+        <think> and the box tags are single special tokens in the GLM-4
+        tokenizers, so they stay whole; </think> is split like plain text.
+        """
+        deltas = []
+        pattern = r"(<think>|<\|begin_of_box\|>|<\|end_of_box\|>)"
+        for segment in re.split(pattern, output):
+            if segment in ("<think>", "<|begin_of_box|>", "<|end_of_box|>"):
+                deltas.append(segment)
+            else:
+                deltas.extend(
+                    segment[i : i + size] for i in range(0, len(segment), size)
+                )
+        return deltas
+
+    @pytest.mark.parametrize("chunk_size", [1, 2, 3, 5, 7, 1000])
+    @pytest.mark.parametrize(
+        "implicit_mode, output, expected",
+        [
+            pytest.param(
+                True,
+                "plan the reply</think>The answer is 42.",
+                ("plan the reply", "The answer is 42."),
+                id="glm47-thinking-enabled-prompt-injected-open-tag",
+            ),
+            pytest.param(
+                False,
+                "The answer is 42.",
+                (None, "The answer is 42."),
+                id="glm47-thinking-disabled-prompt-injected-closed-pair",
+            ),
+            pytest.param(
+                False,
+                "Just a regular response.",
+                (None, "Just a regular response."),
+                id="no-tag-fallback",
+            ),
+            pytest.param(
+                False,
+                "<think>Let me analyze</think>The answer is 42.",
+                ("Let me analyze", "The answer is 42."),
+                id="glm45-tagged",
+            ),
+            pytest.param(
+                False,
+                "<think>analysis</think><|begin_of_box|>Paris<|end_of_box|>",
+                ("analysis", "Paris"),
+                id="glm46v-tagged-box",
+            ),
+            pytest.param(
+                False,
+                "<|begin_of_box|>Paris<|end_of_box|>",
+                (None, "Paris"),
+                id="glm46v-untagged-box",
+            ),
+        ],
+    )
+    def test_streaming_matches_complete_output(
+        self, parser, implicit_mode, output, expected, chunk_size
+    ):
+        """Streaming and complete-output parsing agree on the partition."""
+        parser.reset_state(implicit_mode=implicit_mode)
+        streamed = self._stream(parser, self._chunk(output, chunk_size))
+        assert streamed == expected
+        assert parser.extract_reasoning(output) == expected
+
+    def test_streaming_close_marker_split_with_trailing_text(self, parser):
+        """Every split of </think> keeps all reasoning and content bytes.
+
+        The first delta ends inside </think>; the second completes it and
+        carries the content.
+        """
+        output = "<think>abc</think>xyz"
+        close_at = output.index("</think>")
+        for j in range(1, len("</think>")):
+            deltas = ["<think>", output[7 : close_at + j], output[close_at + j :]]
+            parser.reset_state()
+            assert self._stream(parser, deltas) == ("abc", "xyz"), deltas
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason="GLM-4 pre_think fast path emits a partial <think> as content",
+    )
+    def test_streaming_both_markers_split_with_trailing_text(self, parser):
+        """Every split of <think> and </think> across deltas keeps all text bytes.
+
+        The second delta completes <think>, carries reasoning and ends inside
+        </think>; the third completes </think> and carries content. qwen3 and
+        deepseek_r1 pass this; glm4 leaks the <think> prefix into content.
+        """
+        output = "<think>abc</think>xyz"
+        close_at = output.index("</think>")
+        for i in range(1, len("<think>")):
+            for j in range(1, len("</think>")):
+                deltas = [
+                    output[:i],
+                    output[i : close_at + j],
+                    output[close_at + j :],
+                ]
+                parser.reset_state()
+                streamed = self._stream(parser, deltas)
+                assert streamed == ("abc", "xyz"), deltas
 
 
 class TestDuplicateThinkEndTag:
